@@ -1,9 +1,6 @@
-# [Multiple GPU Support] are places with weird dtype transitions, may cause additional latency.
-
 import torch
 import torch.nn as nn
-
-from .modeling_llama_kv_fused import LlamaForCausalLM as KVLlamaForCausalLM, LlamaModel
+from .modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM, LlamaModel
 # import transformers
 
 # # monkey patch
@@ -17,76 +14,25 @@ from transformers import AutoTokenizer, AutoConfig
 import os
 from huggingface_hub import hf_hub_download
 import warnings
-from copy import deepcopy
 
 from .configuration_eagle import EagleConfig
-from safetensors.torch import load_model
+from .llama.lrdraft import LRDraft
 
 class DraftModel(nn.Module):
-    def __init__(self, config, model: LlamaModel=None):
+    def __init__(self, model: LlamaModel):
         super().__init__()
-        if hasattr(model, "embed_tokens"):
-            del model.embed_tokens
-        
-        self.fc = nn.Linear(config.hidden_size*2, config.hidden_size)
+        self.fc = nn.Linear(model.hidden_size*2, model.hidden_size)
         self.model = model
-        self.lm_head = None
-        self.embed_tokens = None
+        # self.lm_head = head
+        # self.embed_tokens = embed_tokens
 
-        self.total_tokens=60
-        self.depth = 5
-        self.top_k = 10
-        self.threshold = 1.0
-        self.logsoftmax = nn.LogSoftmax(dim=-1)
-    
-    def set_head_and_embed(self, lm_head, embed_tokens):
-        self.lm_head = lm_head
-        self.embed_tokens = embed_tokens
-        for param in self.lm_head.parameters():
-            param.requires_grad = False
-        for param in self.embed_tokens.parameters():
-            param.requires_grad = False
-    
-    def discard_head_and_embed(self):
-        lm_head = self.lm_head
-        embed_tokens = self.embed_tokens
-        self.lm_head = None
-        self.embed_tokens = None
-
-        return lm_head, embed_tokens
-
-    def forward(self, hidden_states, input_ids, embed_tokens=None, **kwargs):
-
-        if embed_tokens is None:
-            if self.embed_tokens is None:
-                raise ValueError("embed_tokens is not provided")
-            embed_tokens = self.embed_tokens
-        
-        with torch.no_grad():
-            inputs_embeds = embed_tokens(input_ids) # [Multiple GPU Support]
-        
-        combined = torch.cat((inputs_embeds.to(hidden_states.device), hidden_states), dim=-1)
-        hidden_states = self.fc(combined.to(self.fc.weight.device))
-        return self.model(inputs_embeds=hidden_states, **kwargs) # returns hidden_states only
-
-    def reset_kv(self):
-        self.stable_kv = None
-
-    def reset(self):
-        self.tree_mask = None
-    
-    def init_tree(self):
-        self.tree_mask_init = torch.eye(self.top_k, device=self.embed_tokens.weight.device)[None, None]
-        self.position_ids = torch.zeros(self.top_k, device=self.embed_tokens.weight.device, dtype=torch.long)
-        self.tree_mask_init = self.tree_mask_init.to(self.embed_tokens.weight.device)
+    def forward(self, input_ids, embed_tokens, attention_mask=None, **kwargs):
+        inputs_embeds = embed_tokens(input_ids)
+        hidden_states = self.fc(torch.cat((inputs_embeds, hidden_states), dim=-1).to(self.fc.weight.dtype))
+        return self.model(inputs_embeds=hidden_states, attention_mask=attention_mask, **kwargs)
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head=None, logits_processor=None):
-        if head is None:
-            if self.lm_head is None:
-                raise ValueError("lm_head is not provided")
-            head = self.lm_head
-
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
         depth = self.depth
@@ -108,37 +54,19 @@ class DraftModel(nn.Module):
         # with Timer("draft many"):
         # print("Before draft many")
         # * forward once, use cache if possible
-        print("Forward once...")
-        print("has stable_kv", hasattr(self, "stable_kv") and self.stable_kv is not None)
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
             # print("has stable_kv")
             # print("input_ids", input_ids[:, kv_len:].shape, end=" ")
             # print("kv_len", kv_len)
-            # out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
-            #                                    past_key_values=self.stable_kv, use_cache=True)
-            outputs = self(hidden_states, input_ids[:, kv_len:], past_key_values=self.stable_kv)
-            out_hidden = outputs.last_hidden_state
-            past_key_values = outputs.past_key_values
-
+            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
+                                               past_key_values=self.stable_kv, use_cache=True)
         else:
             # print("no stable_kv")
             # print("input_ids", input_ids.shape)
-            # out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
-            outputs = self(hidden_states, input_ids)
-            out_hidden = outputs.last_hidden_state
-            past_key_values = outputs.past_key_values
+            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
         # print("After draft many")
-        print("Forward once past_key_values")
-        print(past_key_values) # cache exists!
-        
-        if past_key_values is not None:
-            self.stable_kv = past_key_values
-            print("stable_kv is not None")
-            print(self.stable_kv) # cache exists!
-        else:
-            self.stable_kv = None
-            print("stable_kv is None")
+        self.stable_kv = past_key_values
         last_hidden = out_hidden[:, -1]
 
         # * pass through lm_head
@@ -161,21 +89,12 @@ class DraftModel(nn.Module):
         # 4
 
         # * start generation
-        print("start generation...")
         for i in range(depth):
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids
             # with Timer("draft one"):
-            # out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
-            #                                    position_ids=position_ids, use_cache=True)
-            print(f"depth: {i}")
-            outputs = self(
-                            input_hidden, input_ids, 
-                            past_key_values=past_key_values,
-                            position_ids=position_ids
-                        )
-            out_hidden = outputs.last_hidden_state
-            past_key_values = outputs.past_key_values
+            out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
+                                               position_ids=position_ids, use_cache=True)
             len_posi += 1
 
             # with Timer("sort1"):
@@ -316,110 +235,72 @@ class EagleModelABC(nn.Module):
         Args:
             config (PretrainedConfig): The configuration of the MedusaModel.
         """
-        super().__init__(config) # base model initializations
+        super().__init__(config)
+        # For compatibility with the old APIs
 
-        # if config.model_type == 'eagle': # if config is EagleConfig, additional initializations
-        #     self_name_or_path = config.base_model_name_or_path
-        #     self.draft_model_name_or_path = config.draft_model_name_or_path
-        #     self.tokenizer = AutoTokenizer.from_pretrained(self_name_or_path)
+        self.hidden_size = config.hidden_size
+        self.vocab_size = config.vocab_size
+        self_name_or_path = config.base_model_name_or_path
+        self.target_model_name_or_path = config.target_model_name_or_path
+        self.tokenizer = AutoTokenizer.from_pretrained(self_name_or_path)
         
-        # draft model
-        tiny_model = self.get_tiny_model(config)
+        # copy config
+        draft_config = config.copy()
+        draft_config.num_hidden_layers = 1
+        tiny_model = LlamaModel(draft_config)
         # embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         # lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.draft_model = DraftModel(config, tiny_model)
-    
-    def get_tiny_model(self, config):
-        # draft_config = config.copy()
-        # draft_config.num_hidden_layers = 1
-        # return LlamaModel(config)
-        raise NotImplementedError
+        self.draft_model = DraftModel(tiny_model)
 
     # Add a link named base_model to self
-    # @property
-    # def base_model(self):
-    #     return self
+    @property
+    def base_model(self):
+        return self
     @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path,
         draft_only=False,
-        config=None,
-        total_tokens=-1,
         *args,
         **kwargs,
     ):
-        # Assume pretrained_model_name_or_path only loads the draft model,
-        # base model's weight is loaded from the config
+        # Manually load config to ensure that the medusa_num_heads parameter is loaded
+        try:
+            config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+            return super().from_pretrained(
+                pretrained_model_name_or_path,
+                *args,
+                **kwargs,
+                config=config,
+            )
+        except:
+            # base model
+            config = EagleConfig.from_pretrained(pretrained_model_name_or_path)
+            base_model_config = AutoConfig.from_pretrained(config.base_model_name_or_path)
+            model = super().from_pretrained(
+                config.base_model_name_or_path,
+                *args,
+                **kwargs,
+                config=base_model_config,
+            )
 
-        # load config
-        config = EagleConfig.from_pretrained(pretrained_model_name_or_path)
-        
-        # base model
-        base_model_name_or_path = config.base_model_name_or_path
-        model = super().from_pretrained(
-            base_model_name_or_path,
-            *args,
-            **kwargs,
-        )
-        # replace the config keys with EagleConfig keys
-        for key in config.__dict__.keys():
-            setattr(model.config, key, getattr(config, key))
-    
-        # draft model
-        draft_model_path = os.path.join(pretrained_model_name_or_path, "model.safetensors") # if draft_model uses safetensors
-        load_model(model.draft_model, draft_model_path, strict=False)
-
-        # tokenizer
-        model.tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path)
-
-
-        # Calibrate tree
-        if total_tokens == -1:
-            print("Calibrating total tokens...")
-            device = model.model.layers[0].self_attn.q_proj.weight.device
-            candidate_tokens=[40,48,50,56,60]
-            base_times=[1,1.05,1.07,1.1,1.13]
-            times=[]
-
-            for t_cnt, base_t in zip(candidate_tokens, base_times):
-                input_ids = torch.randint(0, model.config.vocab_size - 200, (1, t_cnt)).to(device)
-                torch.cuda.synchronize()
-                start_time = time.time()
-                for _ in range(20):
-                    torch.cuda.synchronize()
-                    with torch.no_grad():
-                        _ = model(input_ids)
-                    torch.cuda.synchronize()
-                torch.cuda.synchronize()
-                end_time = time.time()
-                times.append((end_time - start_time) / base_t)
-            total_token=candidate_tokens[times.index(min(times))]
-            model.draft_model.total_tokens=total_token-1
-            print(f"total_tokens set to: {total_token}")
-
-
-        if draft_only:
-            draft_model = model.draft_model
-            del model
-            return draft_model
-        else:
-           
+            # draft model
+            draft_model_path = config.draft_model_name_or_path
+            if os.path.exists(draft_model_path):
+                filename = draft_model_path
+            else:
+                # filename = hf_hub_download(pretrained_model_name_or_path, "medusa_lm_head.pt")
+                print(f'Path: {draft_model_path} not found')
+                exit(1)
+            draft_model_state_dict = torch.load(filename, map_location=model.device)
+            model.draft_model.load_state_dict(draft_model_state_dict, strict=False)
             return model
-
-    def setup_draft(self):
-        lm_head = self.lm_head
-        embed_tokens = self.model.embed_tokens
-        self.draft_model.set_head_and_embed(lm_head, embed_tokens)
-        self.draft_model.to(self.dtype)
-        self.draft_model.init_tree()
 
     def eagle_generate(
         self,
         input_ids,
         temperature=0.0,
-        top_p=0.0, 
-        top_k=0.0,
+        top_p=0.8, 
         max_new_tokens=512,
         max_length=2048,
     ):
@@ -444,7 +325,7 @@ class EagleModelABC(nn.Module):
         input_ids = input_ids.clone()
 
         # * not sure, total_tokens are found from calibration, why max_length is reduced by (total_tokens - 10)?
-        max_length=max_length-self.draft_model.total_tokens-10
+        max_length=max_length-self.ea_layer.total_tokens-10
 
         # * prepare the logits processor
         logits_processor = prepare_logits_processor(temperature=temperature, top_p=top_p, top_k=top_k)
@@ -455,7 +336,7 @@ class EagleModelABC(nn.Module):
         prev_input_len = input_ids.shape[1]
 
         # * reset draft model kv cache
-        self.draft_model.reset_kv()
+        self.ea_layer.reset_kv()
 
         # * Initialize kv cache if none
         if hasattr(self, "past_key_values"):
@@ -477,39 +358,25 @@ class EagleModelABC(nn.Module):
         input_len = input_ids.shape[1]
 
         #* target model first inference
-        # outputs, orig, hidden_states = self(
-        #     input_ids, past_key_values=past_key_values
-        # )
-        self.model.tree_mask = None
-        outputs = self(
-            input_ids, 
-            past_key_values=past_key_values,
-            output_hidden_states=True
+        outputs, orig, hidden_states = self(
+            input_ids, past_key_values=past_key_values, output_orig=True
         )
-        orig = outputs.logits
-        hidden_states = outputs.hidden_states[-1]
-        past_key_values = outputs.past_key_values
-        # print("outputs.past_key_values before entering loop")
-        # print(past_key_values) # cache exists!
-
         #* sample token
         token = sampling_logit(logits=orig[:, -1], logits_processor=logits_processor).to(input_ids.device)
         
-        print(f"token: {token.shape} | input_ids: {input_ids.shape} | hidden_state: {hidden_states.shape}")
+
         print("Entering Loop...")
         new_token = 0
         for idx in range(max_length):
             #* Run draft model
-            print("Draft phase...")
             #*      1. concatenate the token temporaily to input_ids (This should be permanent, not temporary, find a way to replace this)
             temp_input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
-            draft_tokens, retrieve_indices, tree_mask, tree_position_ids = self.draft_model.topK_genrate(hidden_states, temp_input_ids, self.lm_head, logits_processor)
-            draft_tokens=draft_tokens.to(input_ids.device) # [Multiple GPU Support]
+            draft_tokens, retrieve_indices, tree_mask, tree_position_ids = self.ea_layer.topK_genrate(hidden_states, temp_input_ids, self.lm_head, logits_processor)
+            draft_tokens=draft_tokens.to(input_ids.device) # multiple gpus support
 
             # * obtains the logits of predictions from target model, by considering the tree_mask (task: validation)
-            print("Verification Phase...")
             self.model.tree_mask = tree_mask
-            logits, hidden_state_new = tree_decoding(
+            logits, hidden_state_new, outputs = tree_decoding(
                 self,
                 draft_tokens,
                 past_key_values,
@@ -529,7 +396,7 @@ class EagleModelABC(nn.Module):
             )
 
             # * 
-            input_ids, token, hidden_states, new_token = update_inference_inputs(
+            input_ids, token, hidden_states, new_token = lr_update_inference_inputs(
                 input_ids,
                 candidates,
                 best_candidate,
@@ -559,20 +426,14 @@ class EagleModelABC(nn.Module):
             if input_ids.shape[1] > max_length:
                 break
 
-class EagleModelLlama(EagleModelABC, KVLlamaForCausalLM):
-
-    def get_tiny_model(self, config):
-        draft_config = deepcopy(config)
-        draft_config.num_hidden_layers = 1
-        return LlamaModel(draft_config)
+class MedusaModelLlama(EagleModelABC, KVLlamaForCausalLM):
+    pass
 
 # class MedusaModelMistral(MedusaModelABC, KVMistralForCausalLM):
 #     pass
 
 
-class EagleModel():
-
-
+class MedusaModel():
     @classmethod
     def from_pretrained(
         cls,
@@ -590,16 +451,16 @@ class EagleModel():
             config.model_type = base_model_config.model_type
 
         if config.model_type == "llama":
-            return EagleModelLlama.from_pretrained(
+            return MedusaModelLlama.from_pretrained(
                 pretrained_model_name_or_path,
                 *args,
                 **kwargs,
             )
-        # elif config.model_type == "mistral":
-        #     return MedusaModelMistral.from_pretrained(
-        #         pretrained_model_name_or_path,
-        #         *args,
-        #         **kwargs,
-        #     )
+        elif config.model_type == "mistral":
+            return MedusaModelMistral.from_pretrained(
+                pretrained_model_name_or_path,
+                *args,
+                **kwargs,
+            )
         else:
             raise ValueError("Only support llama and mistral for now!!")
