@@ -15,8 +15,8 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 # [MODIFIED] Import fused functions
 from torch.nn import BCEWithLogitsLoss, MSELoss
 from xformers.ops import SwiGLU
-from .fused_cross_entropy import FusedCrossEntropyLoss as CrossEntropyLoss
-from .rmsnorm import FusedRMSNorm
+# from .fused_cross_entropy import FusedCrossEntropyLoss as CrossEntropyLoss
+# from .rmsnorm import FusedRMSNorm
 
 # [MODIFIED] Import from transformer library
 from transformers.activations import ACT2FN
@@ -108,35 +108,35 @@ import torch.nn as nn
 import torch
 
 
-# class LlamaRMSNorm(nn.Module):
-#     """
-#     LlamaRMSNorm is equivalent to T5LayerNorm.
+class LlamaRMSNorm(nn.Module):
+    """
+    LlamaRMSNorm is equivalent to T5LayerNorm.
 
-#     Args:
-#         hidden_size (int): The size of the hidden states.
-#         eps (float, optional): A small value to prevent division by zero. Default is 1e-6.
-#     """
+    Args:
+        hidden_size (int): The size of the hidden states.
+        eps (float, optional): A small value to prevent division by zero. Default is 1e-6.
+    """
 
-#     def __init__(self, hidden_size, eps=1e-6):
-#         super().__init__()
-#         self.weight = nn.Parameter(torch.ones(hidden_size))
-#         self.variance_epsilon = eps
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
 
-#     def forward(self, hidden_states):
-#         """
-#         Apply LlamaRMSNorm to the input hidden states.
+    def forward(self, hidden_states):
+        """
+        Apply LlamaRMSNorm to the input hidden states.
 
-#         Args:
-#             hidden_states (torch.Tensor): Input hidden states.
+        Args:
+            hidden_states (torch.Tensor): Input hidden states.
 
-#         Returns:
-#             torch.Tensor: The normalized and scaled hidden states.
-#         """
-#         input_dtype = hidden_states.dtype
-#         hidden_states = hidden_states.to(torch.float32)
-#         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-#         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-#         return self.weight * hidden_states.to(input_dtype)
+        Returns:
+            torch.Tensor: The normalized and scaled hidden states.
+        """
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
 
 
 class LlamaRotaryEmbedding(nn.Module):
@@ -628,8 +628,8 @@ class LlamaDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config)
         self.mlp = LlamaMLP(config)
-        self.input_layernorm = FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = FusedRMSNorm(
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -829,7 +829,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
-        self.norm = FusedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -871,12 +871,10 @@ class LlamaModel(LlamaPreTrainedModel):
         # [MODIFIED] add tree mask
         if hasattr(self, "tree_mask") and self.tree_mask is not None:
             tree_mask = self.tree_mask
-            _, _, tree_shape0, tree_shape1 = tree_mask.shape
-            combined_attention_mask[:, :, -tree_shape0:, -tree_shape1:][
+            tree_len = tree_mask.size(-1)
+            combined_attention_mask[:, :, -tree_len:, -tree_len:][
                 tree_mask == 0
                 ] = torch.finfo(inputs_embeds.dtype).min
-
-        return combined_attention_mask
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(

@@ -584,14 +584,21 @@ class LlamaAttention(nn.Module):
             query_states, key_states, cos, sin, position_ids
         )
 
-        # [MODIFIED] Using KVCache mechanism for preallocated GPU memory optimization
-        # past_key_value is utilized to leverage previously computed key and value states.
-        # If past_key_value is available, reuse the states for k, v, and self_attention.
-        if past_key_value is not None:
-            key_states = past_key_value[0].cat(key_states, dim=2)
-            value_states = past_key_value[1].cat(value_states, dim=2)
-        # Reset past_key_value to avoid return past_key_value.
-        past_key_value = None
+        if self.config.num_hidden_layers > 1:
+            # [MODIFIED] Using KVCache mechanism for preallocated GPU memory optimization
+            # past_key_value is utilized to leverage previously computed key and value states.
+            # If past_key_value is available, reuse the states for k, v, and self_attention.
+            if past_key_value is not None:
+                key_states = past_key_value[0].cat(key_states, dim=2)
+                value_states = past_key_value[1].cat(value_states, dim=2)
+            # Reset past_key_value to avoid return past_key_value.
+            past_key_value = None
+            
+        else: # for draft model use
+            if past_key_value is not None:
+                key_states = torch.cat([past_key_value[0], key_states], dim=2)
+                value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            past_key_value = (key_states, value_states) if use_cache else None
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -672,9 +679,7 @@ class LlamaDecoderLayer(nn.Module):
         self.self_attn = LlamaAttention(config=config)
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
             self,
@@ -894,8 +899,8 @@ class LlamaModel(LlamaPreTrainedModel):
         if input_shape[-1] > 1:
             combined_attention_mask = _make_causal_mask(
                 input_shape,
-                # inputs_embeds.dtype,
-                torch.float32,  # [MODIFIED] force to cast to float32
+                inputs_embeds.dtype,
+                # torch.float32,  # [MODIFIED] force to cast to float32
                 device=inputs_embeds.device,
                 past_key_values_length=past_key_values_length,
             )
@@ -911,13 +916,19 @@ class LlamaModel(LlamaPreTrainedModel):
                 else expanded_attn_mask + combined_attention_mask
             )
 
-
+        # [MODIFIED] add tree mask
         if hasattr(self, "tree_mask") and self.tree_mask is not None:
             tree_mask = self.tree_mask
-            tree_len = tree_mask.size(-1)
-            combined_attention_mask[:, :, -tree_len:, -tree_len:][
+            _, _, tree_shape0, tree_shape1 = tree_mask.shape
+            combined_attention_mask[:, :, -tree_shape0:, -tree_shape1:][
                 tree_mask == 0
-                ] = combined_attention_mask.min()
+                ] = torch.finfo(inputs_embeds.dtype).min
+        # if hasattr(self, "tree_mask") and self.tree_mask is not None:
+        #     tree_mask = self.tree_mask
+        #     tree_len = tree_mask.size(-1)
+        #     combined_attention_mask[:, :, -tree_len:, -tree_len:][
+        #         tree_mask == 0
+        #         ] = combined_attention_mask.min()
 
         return combined_attention_mask
 
@@ -959,6 +970,7 @@ class LlamaModel(LlamaPreTrainedModel):
             batch_size, seq_length = input_ids.shape
         elif inputs_embeds is not None:
             batch_size, seq_length, _ = inputs_embeds.shape
+            # print(f"inputs_embeds.shape: {batch_size}, {seq_length}, {_}")
         else:
             raise ValueError(
                 "You have to specify either decoder_input_ids or decoder_inputs_embeds"
@@ -974,10 +986,7 @@ class LlamaModel(LlamaPreTrainedModel):
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = torch.arange(
-                past_key_values_length,
-                seq_length + past_key_values_length,
-                dtype=torch.long,
-                device=device,
+                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device,
             )
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
@@ -988,16 +997,18 @@ class LlamaModel(LlamaPreTrainedModel):
         # embed positions
         if attention_mask is None:
             attention_mask = torch.ones(
-                (batch_size, seq_length_with_past),
-                dtype=torch.bool,
-                device=inputs_embeds.device,
+                (batch_size, seq_length_with_past), dtype=torch.bool, device=inputs_embeds.device,
             )
+        # print(f"inputs_embeds.shape: {inputs_embeds.shape}")
+        # print(f"use_cache: {use_cache}")
+        # print(f"past_key_values_length: {past_key_values_length}")
         attention_mask = self._prepare_decoder_attention_mask(
-            attention_mask,
-            (batch_size, seq_length),
-            inputs_embeds,
-            past_key_values_length,
+            attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length,
         )
+        # if inputs_embeds is not None:
+        #     print(f"attention_mask, shape:{attention_mask.shape}")
+        #     if (attention_mask.shape[-2] < 100):
+        #         exit(0)
 
         hidden_states = inputs_embeds
 
@@ -1014,21 +1025,18 @@ class LlamaModel(LlamaPreTrainedModel):
         next_decoder_cache = () if use_cache else None
 
         for idx, decoder_layer in enumerate(self.layers):
-            # if idx==16:
-            #     print(idx)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            past_key_value = (
-                past_key_values[idx] if past_key_values is not None else None
-            )
-
+            past_key_value = past_key_values[idx] if past_key_values is not None else None
+            
             if self.gradient_checkpointing and self.training:
 
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
                         # None for past_key_value
-                        return module(*inputs, output_attentions, None)
+                        # return module(*inputs, output_attentions, None)
+                        return module(*inputs, past_key_value, output_attentions)
 
                     return custom_forward
 
@@ -1072,7 +1080,7 @@ class LlamaModel(LlamaPreTrainedModel):
             )
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
-            past_key_values=next_cache,
+            past_key_values=None if not use_cache else next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
@@ -1214,7 +1222,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
+            hidden_states=outputs.last_hidden_state, #outputs.hidden_states, [Modified]
             attentions=outputs.attentions,
         )
 

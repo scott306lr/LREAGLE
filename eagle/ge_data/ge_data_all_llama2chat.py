@@ -1,12 +1,14 @@
 import argparse
 import copy
+from time import sleep
 
 parser = argparse.ArgumentParser(description='sp')
 parser.add_argument('--start', type=int, default=0)
 parser.add_argument('--end', type=int, default=100)
 parser.add_argument('--index', type=int, default=1)
-parser.add_argument('--gpu_index', type=int, nargs='+', default=[0])
+parser.add_argument('--gpu_index', type=int, nargs='+', default=[0, 1, 2])
 parser.add_argument('--outdir', type=str, default='outdir0')
+parser.add_argument('--dtype', type=str, default='fp16')
 args = parser.parse_args()
 import os
 
@@ -19,10 +21,10 @@ from datasets import load_dataset
 import json
 from fastchat.model.model_adapter import get_conversation_template
 
-bigname="/home/hongyanz/scratch/weights/llama2chat/13B"
-# bigname = "/home/lyh/weights/hf/llama/7B/"
+bigname="meta-llama/Llama-2-7b-chat-hf"
 # smallname = "/home/lyh/weights/hf/llama/7B/"
 
+dataset_dir = "Aeala/ShareGPT_Vicuna_unfiltered"
 
 
 def longest_common_prefix(list1, list2):
@@ -43,7 +45,8 @@ def build_dataset_rank(
         tokenizer, split="train",
         select=None,
 ):
-    ds = load_dataset('json', data_files="/home/hongyanz/scratch/data/ShareGPT_V4.3_unfiltered_cleaned_split.json")
+    # ds = load_dataset('json', data_files=data_dir)
+    ds = load_dataset(dataset_dir)
     ds = ds['train']
     ds = ds.shuffle(seed=42)
     ds1 = ds.select(range(args.start, args.end))
@@ -52,7 +55,7 @@ def build_dataset_rank(
     # ds2=ds.select(range(300,len(ds)))
     original_columns1 = ds1.column_names
     # original_columns2 = ds2.column_names
-    num_proc = 4
+    num_proc = 32#16#64#16#4
 
     def preprocess_function(examples):
         new_examples = {
@@ -165,8 +168,16 @@ print(ds)
 #     )
 # bigmodel = AutoModelForCausalLM.from_pretrained(bigname, load_in_4bit=True, device_map={"": 0}, )
 # smallmodel = AutoModelForCausalLM.from_pretrained(smallname, load_in_4bit=True, device_map={"": 1}, )
-bigmodel = AutoModelForCausalLM.from_pretrained(bigname,  device_map="auto",torch_dtype=torch.float16)
-#bigmodel = AutoModelForCausalLM.from_pretrained(bigname,  device_map="auto",load_in_8bit=True)
+# bigmodel = AutoModelForCausalLM.from_pretrained(bigname, device_map="auto",torch_dtype=torch.float16)
+if args.dtype == 'fp16':
+    dtype = torch.float16
+elif args.dtype == 'bf16':
+    dtype = torch.bfloat16
+else:
+    dtype = torch.float32
+
+print("dtype:",dtype)
+bigmodel = AutoModelForCausalLM.from_pretrained(bigname,  device_map="auto", attn_implementation="sdpa", torch_dtype=dtype)
 bigmodel.eval()
 
 
@@ -190,7 +201,8 @@ def ge(data):
     td={"input_ids":input_ids.cpu()[0],"hidden_state":hidden_state_big.cpu()[0],"loss_mask":data["loss_mask"].cpu()[0]}
     return td
 
-outdir = f'{args.outdir}/{args.index}'
+# outdir = f'{args.outdir}/{args.index}'
+outdir = os.path.join(args.outdir, f"gpu{str(args.index)}")
 if not os.path.exists(outdir):
     os.makedirs(outdir)
 
@@ -202,7 +214,8 @@ def writedata(name,data_point):
     torch.save(data_point, f'{name}/data_{idx}.ckpt')
 
 
-for id,data in enumerate(ds):
+print("Output directory:",outdir)
+for id,data in tqdm(enumerate(ds)):
     if id%100==0:
         print(id,end="\t")
     if id % 1000 == 0:

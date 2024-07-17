@@ -27,15 +27,15 @@ def main(args):
         #     ol=output_ids.shape[1]
         _ = model.eagle_generate(input_ids)
 
-    eagle_conf_path = '/home/scott306lr_l/checkpoints/eagle/sharegpt0.1_fixed_fp16_refactor_2/model_20'
+    eagle_conf_path = '/home/nctu/scott306lr/checkpoints/model_20'
     print("Loading model...")
     model = EagleModelLlama.from_pretrained(
         eagle_conf_path,
-        # torch_dtype=torch.float16,
-        # low_cpu_mem_usage=True,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
         device_map="auto",
     )
-    model.setup_draft()
+    # model.setup_draft()
     print("Loaded.")
     # model = EaModel.from_pretrained(
     #     base_model_path=args.base_model_path,
@@ -50,6 +50,11 @@ def main(args):
     # set model to eval mode, and warmup the model
     model.eval()
     # warmup(model)
+
+    #test device
+    # for n, m in model.named_parameters():
+    #     print(f"{n}: {m.device}")
+    # exit(0)
 
     # input message
     your_message="What's the best way to start learning a new language?"
