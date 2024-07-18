@@ -107,13 +107,13 @@ class DraftModel(nn.Module):
             self.embed_tokens.weight.device)
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, head, logits_processor=None):
+    def topK_generate(self, hidden_states, input_ids, head, logits_processor=None):
         debug_print(
             {
                 "hidden_states": hidden_states,
                 "input_ids": input_ids
             }, 
-            headings="topK_genrate", exit_code=False
+            headings="topK_generate", exit_code=False
         )
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
@@ -638,7 +638,7 @@ class EagleModelABC(nn.Module):
             # print("Draft phase...")
             # *      1. concatenate the token temporaily to input_ids (This should be permanent, not temporary, find a way to replace this)
             temp_input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
-            draft_tokens, retrieve_indices, tree_mask, tree_position_ids = self.draft_model.topK_genrate(hidden_states, temp_input_ids, logits_processor)
+            draft_tokens, retrieve_indices, tree_mask, tree_position_ids = self.draft_model.topK_generate(hidden_states, temp_input_ids, logits_processor)
             draft_tokens = draft_tokens.to(input_ids.device)  # [Multiple GPU Support]
 
             # * obtains the logits of predictions from target model, by considering the tree_mask (task: validation)
