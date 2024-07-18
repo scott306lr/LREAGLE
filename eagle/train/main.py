@@ -347,7 +347,7 @@ def main(args):
         "lr": args.lr,
         "bs": args.bs,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
-        "datapath": f"{args.tmpdir}",
+        "datapath": f"{args.datadir}",
         "num_epochs": 20,
         # Depending on your data and model size, the larger the model, the higher the sample efficiency. We recommend setting it between 20-40.
         "num_warmup_steps": 2000,
@@ -408,8 +408,8 @@ def main(args):
                             collate_fn=DataCollatorWithPadding(), num_workers=train_config["num_workers"], pin_memory=True)
     
     if accelerator.is_main_process:
-        if not os.path.exists(args.cpdir):
-            os.makedirs(args.cpdir)
+        if not os.path.exists(args.savedir):
+            os.makedirs(args.savedir)
 
 
     # Load model configs.
@@ -430,9 +430,6 @@ def main(args):
     del big_model
 
     print("Loading draft model...")
-    # config = EConfig.from_pretrained(train_config["config_path"])
-    # model = Model(config, load_emb=True, path=args.basepath)
-    draft_model_path = os.path.join(args.base_dir, "model.safetensors")
     draft_config = deepcopy(config)
     draft_config.num_hidden_layers = 1
     tiny_model = LlamaModel(draft_config)
@@ -470,20 +467,19 @@ def main(args):
             validate(
                 model, test_loader, 
                 criterion, train_config, 
-                epoch, num_epochs, args.cpdir, accelerator
+                epoch, num_epochs, args.savedir, accelerator
             )
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='sp')
-    parser.add_argument('--base-dir', type=str, default='/home/lyh/weights/hf/vicuna_v13/7B/')
     parser.add_argument('--configpath', type=str, default="config.json")
     parser.add_argument('--lr', type=float, default=3e-5)
     parser.add_argument('--bs', type=int, default=4)
     parser.add_argument('--gradient-accumulation-steps', type=int, default=1)
-    parser.add_argument('--tmpdir', type=str, default='0')
+    parser.add_argument('--datadir', type=str, default='0')
     parser.add_argument('--outdir', type=str, default='0')
-    parser.add_argument('--cpdir', type=str, default='0')
+    parser.add_argument('--savedir', type=str, default='0')
     parser.add_argument('--data-ratio', type=float, default=1)
     # set to true without having to pass a true argument
     parser.add_argument('--wandb', action='store_true')
