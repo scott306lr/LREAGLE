@@ -258,21 +258,12 @@ def tree_decoding(
         retrieve_indices,
 ):
     position_ids = tree_position_ids + input_ids.shape[1]
-
-    # outputs, tree_logits, hidden_state = model(
-    #     tree_candidates,
-    #     output_orig=True,
-    #     past_key_values=past_key_values,
-    #     position_ids=position_ids,
-    # )
-    outputs = model(
+    outputs, tree_logits, hidden_state = model.eagle_forward(
         tree_candidates,
+        output_orig=True,
         past_key_values=past_key_values,
         position_ids=position_ids,
     )
-    tree_logits = outputs.logits
-    hidden_state = outputs.hidden_states
-
     logits = tree_logits[0, retrieve_indices]
     return logits, hidden_state
 

@@ -11,8 +11,12 @@ from typing import Any, Dict, List
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-from ..model.ea_model import EagleModelLlama
+from ..model.configuration_eagle import EagleConfig
+from ..model.ea_model import DraftModel
+from ..model.modeling_llama_kv import LlamaForCausalLM as KVLlamaForCausalLM
+from ..model.modeling_llama_kv import LlamaModel
 from tqdm import tqdm
+from copy import deepcopy
 import wandb
 
 class AddGaussianNoise:
@@ -144,9 +148,7 @@ def top_accuracy(output, target, topk=(1,)):
 def getkacc(model, data, head, max_length=5, dtype=torch.float32):
     hidden_states = data["hidden_states"].to(dtype)
     input_ids = data["input_ids"]
-    # attention_mask=data["attention_mask"]
     loss_mask = data["loss_mask"]
-    # sample_mask=data["sample_mask"]
     target = data["target"].to(dtype)
     total = [0 for _ in range(max_length)]
     correct = [0 for _ in range(max_length)]
@@ -410,15 +412,37 @@ def main(args):
             os.makedirs(args.cpdir)
 
 
+    # Load model configs.
+    config = EagleConfig.from_pretrained(train_config["config_path"])
+
+    print("Lodaing head and embed_tokens...")
+    base_model_name_or_path = config.base_model_name_or_path
+    big_model = KVLlamaForCausalLM.from_pretrained(base_model_name_or_path)
+    # create new head and embed_tokens
+    head = torch.nn.Linear(big_model.config.hidden_size, big_model.config.vocab_size, bias=False)
+    embed_tokens = nn.Embedding(big_model.config.vocab_size,big_model.config.hidden_size, big_model.config.pad_token_id)
+    # not traininable
+    for param in head.parameters():
+        param.requires_grad = False
+    for param in embed_tokens.parameters():
+        param.requires_grad = False
+    # delete big model
+    del big_model
+
     print("Loading draft model...")
-    # config = AutoConfig.from_pretrained(train_config["config_path"])
-    model = EagleModelLlama.from_pretrained(
-        train_config["config_path"],
-        torch_dtype=torch.float32,
-        total_tokens=60, # to prevent calibration
-        draft_only=True,
-        load_draft_weight=False
-    )
+    # config = EConfig.from_pretrained(train_config["config_path"])
+    # model = Model(config, load_emb=True, path=args.basepath)
+    draft_model_path = os.path.join(args.base_dir, "model.safetensors")
+    draft_config = deepcopy(config)
+    draft_config.num_hidden_layers = 1
+    tiny_model = LlamaModel(draft_config)
+    model = DraftModel(draft_config)
+    model.model = tiny_model
+    model.lm_head = head
+    model.embed_tokens = embed_tokens
+
+    print("Loaded.")
+
 
     criterion = nn.SmoothL1Loss(reduction="none")
     optimizer = optim.AdamW(model.parameters(), lr=train_config["lr"], betas=(train_config["b1"], train_config["b2"]))
@@ -434,9 +458,7 @@ def main(args):
         model, optimizer, train_loader, test_loader, scheduler
     )
         
-    # accelerator.load_state("checkpoints/state_5")
-    # alpha = 0.99
-    # lamb = 5.0
+    print("Start training...")
     for epoch in range(num_epochs):
         train_one_epoch(
             model, train_loader, 
@@ -444,7 +466,7 @@ def main(args):
             epoch, num_epochs, accelerator
         )
         
-        if (num_epochs == epoch-1) or (epoch % train_config["save_freq"] == 0):
+        if (epoch == num_epochs-1) or (epoch % train_config["save_freq"] == 0):
             validate(
                 model, test_loader, 
                 criterion, train_config, 
@@ -454,7 +476,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='sp')
-    parser.add_argument('--basepath', type=str, default='/home/lyh/weights/hf/vicuna_v13/7B/')
+    parser.add_argument('--base-dir', type=str, default='/home/lyh/weights/hf/vicuna_v13/7B/')
     parser.add_argument('--configpath', type=str, default="config.json")
     parser.add_argument('--lr', type=float, default=3e-5)
     parser.add_argument('--bs', type=int, default=4)
@@ -466,6 +488,6 @@ if __name__ == '__main__':
     # set to true without having to pass a true argument
     parser.add_argument('--wandb', action='store_true')
     args = parser.parse_args()
-    main(args)  # 或是任何你想執行的函式
+    main(args)
 
     

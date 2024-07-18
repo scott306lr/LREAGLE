@@ -1,6 +1,15 @@
 # Source: https://github.com/huggingface/transformers/blob/v4.31-release/src/transformers/models/llama/modeling_llama.py
 # Modifications are denoted by the symbol: [MODIFIED]
 
+def debug_print(tensor_dict, headings="DEBUG", exit_code=False):
+    print(f"------------------ {headings}")
+    for key, value in tensor_dict.items():
+        print(f"{key}:\t {value.device}, {value.shape}")
+    print("------------------")
+
+    if exit_code is True:
+        print("Exited.")
+        exit(1)
 
 """ PyTorch LLaMA model."""
 import math

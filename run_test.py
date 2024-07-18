@@ -27,24 +27,21 @@ def main(args):
         #     ol=output_ids.shape[1]
         _ = model.eagle_generate(input_ids)
 
-    eagle_conf_path = '/home/nctu/scott306lr/checkpoints/model_20'
     print("Loading model...")
+    eagle_conf_path = '/home/nctu/scott306lr/LREAGLE/eagle/eagle-llama2-7b'
     model = EagleModelLlama.from_pretrained(
         eagle_conf_path,
         torch_dtype=torch.float16,
         low_cpu_mem_usage=True,
         device_map="auto",
+        load_draft_weight=True,#False
+        total_tokens=60
     )
-    # model.setup_draft()
     print("Loaded.")
-    # model = EaModel.from_pretrained(
-    #     base_model_path=args.base_model_path,
-    #     ea_model_path=args.EAGLE_model_path,
-    #     torch_dtype=torch.float16,
-    #     low_cpu_mem_usage=True,
-    #     device_map="auto"
-    # )z
-
+    # input("enter to exit...")
+    # for n, m in model.named_parameters():
+    #     print(f"{n}: {m.device}")
+    # exit(0)
 
 
     # set model to eval mode, and warmup the model
@@ -78,9 +75,9 @@ def main(args):
     # generate response
     print("Generating response...")
     start_time = time.time()
-    # output_ids=model.eagle_generate(input_ids,temperature=0.5,max_new_tokens=512)
-    for output_ids in model.eagle_generate(input_ids):
-        print(output_ids, end='')
+    output_ids = model.eagle_generate(input_ids, temperature=args.temp, max_new_tokens=args.max_new_token)
+    # for output_ids in model.eagle_generate_generator(input_ids, temperature=args.temp, max_new_tokens=args.max_new_token):
+    #     print(output_ids, end='')
     end_time = time.time()
     
     output=model.tokenizer.decode(output_ids[0][input_ids.shape[1]:])
@@ -110,9 +107,9 @@ if __name__ == "__main__":
         help="The maximum number of new generated tokens.",
     )
     parser.add_argument(
-        "--temperature",
+        "--temp",
         type=float,
-        default=0.5,
+        default=0.0, #0.5,
         help="The temperature for sampling.",
     )
     parser.add_argument(

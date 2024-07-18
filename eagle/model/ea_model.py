@@ -25,6 +25,19 @@ from safetensors.torch import load_model
 from typing import List, Optional, Tuple, Union
 
 
+def debug_print(tensor_dict, headings="DEBUG", exit_code=False):
+    pass
+
+    # print(f"------------------ {headings}")
+    # for key, value in tensor_dict.items():
+    #     print(f"{key}:\t {value.device}, {value.shape}")
+    # print("------------------")
+
+    # if exit_code is True:
+    #     print("Exited.")
+    #     exit(1)
+
+
 class DraftModel(nn.Module):
     def __init__(self, config, model: LlamaModel = None):
         super().__init__()
@@ -59,13 +72,19 @@ class DraftModel(nn.Module):
         return lm_head, embed_tokens
 
     def forward(self, hidden_states, input_ids, embed_tokens=None, past_key_values=None, **kwargs):
-
         if embed_tokens is None:
             if self.embed_tokens is None:
                 raise ValueError("embed_tokens is not provided")
             embed_tokens = self.embed_tokens
 
         with torch.no_grad():
+            debug_print(
+                {
+                    "input_ids": input_ids,
+                    "embed_tokens": embed_tokens.weight
+                }, 
+                headings="Draft Forward", exit_code=False
+            )
             inputs_embeds = embed_tokens(input_ids)  # [Multiple GPU Support]
 
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
@@ -88,13 +107,21 @@ class DraftModel(nn.Module):
             self.embed_tokens.weight.device)
 
     @torch.no_grad()
-    def topK_genrate(self, hidden_states, input_ids, logits_processor=None):
+    def topK_genrate(self, hidden_states, input_ids, head, logits_processor=None):
+        debug_print(
+            {
+                "hidden_states": hidden_states,
+                "input_ids": input_ids
+            }, 
+            headings="topK_genrate", exit_code=False
+        )
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
         depth = self.depth
         top_k = self.top_k
 
         sample_token = input_ids[:, -1]
+        input_ids = input_ids.to(hidden_states.device)
 
         scores_list = []
         parents_list = []
@@ -102,7 +129,6 @@ class DraftModel(nn.Module):
 
         input_ids = input_ids[:, 1:]
         # input_ids = input_ids.to(hidden_states.device)
-        # print("B: input_ids", input_ids.shape)
 
         len_posi = input_ids.shape[1]
         self.reset()
@@ -123,6 +149,7 @@ class DraftModel(nn.Module):
 
         # * pass through lm_head
         last_headout = self.lm_head(last_hidden)
+        # last_headout = head(last_hidden)
 
         # * sample top_k
         last_p = self.logsoftmax(last_headout)
@@ -331,7 +358,7 @@ class EagleModelABC(nn.Module):
         # tokenizer
         print("Load tokenizer...")
         model.tokenizer = AutoTokenizer.from_pretrained(
-            base_model_name_or_path)
+            base_model_name_or_path, use_fast=False)
 
         # Calibrate tree
         if total_tokens == -1:
@@ -370,7 +397,7 @@ class EagleModelABC(nn.Module):
         self.draft_model = DraftModel(config, tiny_model)
 
         if load_draft_weight:
-            load_model(self.draft_model, draft_model_path, strict=False)
+            load_model(self.draft_model, draft_model_path, strict=True)
 
         # set lm_-head, embed_tokens
         lm_head = self.lm_head
@@ -384,6 +411,43 @@ class EagleModelABC(nn.Module):
 
         # Init tree mask and position id
         self.draft_model.init_tree()
+
+    # Calling self() causes weird problems.
+    # Hence rename forward function, call self.eagle_forward() instead.
+    def eagle_forward( 
+        self,
+        input_ids=None,
+        attention_mask=None,
+        past_key_values=None,
+        output_orig=False,
+        position_ids=None,
+    ):
+
+        with torch.inference_mode():
+            # Pass input through the base model
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+            )
+            if output_orig:
+                orig = self.lm_head(outputs[0])
+            hidden_states = outputs[0]
+
+            debug_print(
+                {
+                    "self.lm_head": self.lm_head.weight,
+                    "hidden_states": hidden_states,
+                    "input_ids": input_ids
+                }, 
+                headings="In EAModel", exit_code=False
+            )
+            
+        if output_orig:
+            return outputs, orig, hidden_states
+        else:
+            return outputs, hidden_states
 
     def eagle_generate(
         self,
@@ -426,15 +490,29 @@ class EagleModelABC(nn.Module):
             self.past_key_values_data = past_key_values_data
             self.current_length_data = current_length_data
 
+        debug_print(
+            {
+                # "hidden_states": hidden_states,
+                "input_ids": input_ids
+            }, 
+            headings="Before Prefill", exit_code=False
+        )
         # * target model first inference
         self.model.tree_mask = None
-        outputs = self(
+        outputs, orig, hidden_states = self.eagle_forward(
             input_ids,
             past_key_values=past_key_values,
-            output_hidden_states=True
+            output_orig=True
         )
-        orig = outputs.logits
-        hidden_states = outputs.hidden_states
+        # orig = outputs.logits
+        # hidden_states = outputs.hidden_states
+        debug_print(
+            {
+                "hidden_states": hidden_states,
+                "input_ids": input_ids
+            }, 
+            headings="After Prefill", exit_code=False
+        )
 
         # * sample token
         token = sampling_logit(logits=orig[:, -1], logits_processor=logits_processor)
@@ -447,7 +525,7 @@ class EagleModelABC(nn.Module):
             # print("Draft phase...")
             # *      1. concatenate the token temporaily to input_ids (This should be permanent, not temporary, find a way to replace this)
             temp_input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
-            draft_tokens, retrieve_indices, tree_mask, tree_position_ids = self.draft_model.topK_genrate(hidden_states, temp_input_ids, logits_processor)
+            draft_tokens, retrieve_indices, tree_mask, tree_position_ids = self.draft_model.topK_generate(hidden_states, temp_input_ids, logits_processor)
             draft_tokens = draft_tokens.to(input_ids.device)  # [Multiple GPU Support]
 
             # * obtains the logits of predictions from target model, by considering the tree_mask (task: validation)
@@ -493,6 +571,7 @@ class EagleModelABC(nn.Module):
                 break
             if input_ids.shape[1] > max_length:
                 break
+        return input_ids
 
     def eagle_generate_generator(
         self,
