@@ -23,19 +23,19 @@ from .configuration_eagle import EagleConfig
 from safetensors.torch import load_model
 
 from typing import List, Optional, Tuple, Union
+import logging as log
 
+def debug_print(tensor_dict, headings="DEBUG", print_data=False, exit_code=False):
+    log.debug(f"------------------ {headings}")
+    for key, value in tensor_dict.items():
+        log.debug(f"{key}:\t {value.device}, {value.shape}")
+        if print_data:
+            log.debug(value)
+    log.debug("------------------")
 
-def debug_print(tensor_dict, headings="DEBUG", exit_code=False):
-    pass
-
-    # print(f"------------------ {headings}")
-    # for key, value in tensor_dict.items():
-    #     print(f"{key}:\t {value.device}, {value.shape}")
-    # print("------------------")
-
-    # if exit_code is True:
-    #     print("Exited.")
-    #     exit(1)
+    if exit_code is True:
+        log.debug("Exited.")
+        exit(1)
 
 
 class DraftModel(nn.Module):
@@ -54,6 +54,7 @@ class DraftModel(nn.Module):
         self.top_k = 10
         self.threshold = 1.0
         self.logsoftmax = nn.LogSoftmax(dim=-1)
+        self.softmax = nn.Softmax(dim=-1)
 
     def set_head_and_embed(self, lm_head, embed_tokens):
         self.lm_head = lm_head
@@ -78,13 +79,6 @@ class DraftModel(nn.Module):
             embed_tokens = self.embed_tokens
 
         with torch.no_grad():
-            debug_print(
-                {
-                    "input_ids": input_ids,
-                    "embed_tokens": embed_tokens.weight
-                }, 
-                headings="Draft Forward", exit_code=False
-            )
             inputs_embeds = embed_tokens(input_ids)  # [Multiple GPU Support]
 
         inputs_embeds = inputs_embeds.to(hidden_states.dtype)
@@ -105,105 +99,115 @@ class DraftModel(nn.Module):
             self.top_k, device=self.embed_tokens.weight.device, dtype=torch.long)
         self.tree_mask_init = self.tree_mask_init.to(
             self.embed_tokens.weight.device)
+        debug_print(
+            {
+                "tree_mask_init": self.tree_mask_init,
+                "position_ids": self.position_ids
+            },
+            headings="Init Tree", exit_code=False
+        )
 
     @torch.no_grad()
     def topK_generate(self, hidden_states, input_ids, head, logits_processor=None):
-        debug_print(
-            {
-                "hidden_states": hidden_states,
-                "input_ids": input_ids
-            }, 
-            headings="topK_generate", exit_code=False
-        )
+        # Preparation
         input_ids = input_ids.to(hidden_states.device)
         total_tokens = self.total_tokens
         depth = self.depth
         top_k = self.top_k
+        self.tree_mask = None
 
+        # sample_token is the last token sampled from the target model
         sample_token = input_ids[:, -1]
-        input_ids = input_ids.to(hidden_states.device)
+        input_ids = input_ids[:, 1:]
 
+        # for building tree
         scores_list = []
         parents_list = []
         ss_token = []
 
-        input_ids = input_ids[:, 1:]
-        # input_ids = input_ids.to(hidden_states.device)
-
+        # for position_ids in tree decoding
         len_posi = input_ids.shape[1]
-        self.reset()
 
-        # * forward once, use cache if possible
+        debug_print(
+            {
+                "hidden_states": hidden_states,
+                "input_ids": input_ids
+            },
+            headings="TopK Generate, Preparation", exit_code=False
+        )
+        # First forward pass (prefill)
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
             outputs = self(hidden_states, input_ids[:, kv_len:], past_key_values=self.stable_kv)
-            out_hidden = outputs.last_hidden_state
-            past_key_values = outputs.past_key_values
-
         else:
             outputs = self(hidden_states, input_ids)
-            out_hidden = outputs.last_hidden_state
-            past_key_values = outputs.past_key_values
+        out_hidden = outputs.last_hidden_state
+        past_key_values = outputs.past_key_values
         self.stable_kv = past_key_values
-        last_hidden = out_hidden[:, -1]
+        last_hidden = out_hidden[:, None, -1] # [batch, 1, hidden_size]
 
-        # * pass through lm_head
-        last_headout = self.lm_head(last_hidden)
-        # last_headout = head(last_hidden)
-
-        # * sample top_k
-        last_p = self.logsoftmax(last_headout)
+        # Pass through lm_head and sample top_k
+        #! currently assuming first dimension=1 (batch size=1)
+        #! last_hidden[0] removes batch dimension
+        last_headout = self.lm_head(last_hidden[0]) # prob of each token_id
+        last_p = self.logsoftmax(last_headout) #TODO: compare softmax & logsoftmax
         top = torch.topk(last_p, top_k, dim=-1)
         topk_index, topk_p = top.indices, top.values
+        log.debug("First topk")
+        log.debug(f"topk_index: {topk_index.shape} | topk_p: {topk_p.shape}")
 
-        # * append scores and corresponding tokens to lists
+        # Initialize lists
         scores = topk_p[0]
         scores_list.append(scores[None])
         parents_list.append(torch.zeros(1, dtype=torch.long, device=scores.device))
         ss_token.append(topk_index)
-        input_ids = topk_index
-        input_hidden = last_hidden[None].repeat(1, top_k, 1)  # ! What is this???
-        tree_mask = self.tree_mask_init
-        # [0, 1, 2, 3, ..., top_k-1]
-        topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device)
-        # 4
 
-        # * start generation
+        input_ids = topk_index
+        log.debug(f"last_hidden: {last_hidden.shape}")
+        input_hidden = last_hidden.repeat(1, top_k, 1) # ! Unefficient! Find a way to reduce this line
+        log.debug(f"input_hidden: {input_hidden.shape}")
+        tree_mask = self.tree_mask_init
+
+        # for building tree index
+        topk_cs_index = torch.arange(top_k, device=self.embed_tokens.weight.device) # [0, 1, 2, 3, ..., top_k-1]
+
+        # Start generation loop
         for i in range(depth):
             self.tree_mask = tree_mask
             position_ids = len_posi + self.position_ids
-            # print(f"depth: {i}")
-            outputs = self(
-                input_hidden, input_ids,
-                past_key_values=past_key_values,
-                position_ids=position_ids
-            )
+            # debug_print(
+            #     {
+            #         "tree_mask": self.tree_mask,
+            #         "position_ids": position_ids
+            #     },
+            #     headings="Tree Mask", exit_code=False#, print_data=True
+            # )
+            outputs = self(input_hidden, input_ids, past_key_values=past_key_values, position_ids=position_ids)
             out_hidden = outputs.last_hidden_state
             past_key_values = outputs.past_key_values
             len_posi += 1
 
-            # with Timer("sort1"):
+            # building tree pointers to parent
             bias1 = top_k if i > 0 else 0
             bias2 = max(0, i - 1)
             bias = 1 + top_k ** 2 * bias2 + bias1
             parents = (topk_cs_index + bias)
             parents_list.append(parents)
-
+        
             last_headout = self.lm_head(out_hidden[0])
             last_p = self.logsoftmax(last_headout)
-
             top = torch.topk(last_p, top_k, dim=-1)
             topk_index, topk_p = top.indices, top.values
 
-            cu_scores = topk_p + scores[:, None]
-
-            topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1)
+            # logsoftmax -> logged probability adds up
+            cu_scores = topk_p + scores[:, None] # cs: cumulative scores, torch.Size([10, 10])
+            topk_cs = torch.topk(cu_scores.view(-1), top_k, dim=-1) # cu_scores.view(-1) -> torch.Size([100])
             topk_cs_index, topk_cs_p = topk_cs.indices, topk_cs.values
             scores = topk_cs_p
 
-            out_ids = topk_cs_index // top_k
-            input_hidden = out_hidden[:, out_ids]
-            input_ids = topk_index.view(-1)[topk_cs_index][None]
+            out_ids = topk_cs_index // top_k # find the index (parent node) of the token
+            input_hidden = out_hidden[:, out_ids] # obtain the parents hidden states for each token
+            input_ids = topk_index.view(-1)[topk_cs_index][None] # get the new sampled tokens, with batch size back. [1, 10]
 
             ss_token.append(topk_index)
             scores_list.append(cu_scores)
@@ -217,8 +221,6 @@ class DraftModel(nn.Module):
 
         draft_tokens = ss_token_list[top_scores_index]
         draft_tokens = torch.cat((sample_token, draft_tokens), dim=0)
-        #[Modified] multigpu problem, check why original eagle doesn't do this
-        # draft_tokens = torch.cat((sample_token.to(draft_tokens.device), draft_tokens), dim=0)
 
         draft_parents = torch.cat(parents_list, dim=0)[top_scores_index // top_k].long()
         mask_index = torch.searchsorted(top_scores_index, draft_parents - 1, right=False)
@@ -232,20 +234,6 @@ class DraftModel(nn.Module):
         for i in range(total_tokens):
             tree_mask[i + 1].add_(tree_mask[mask_index_list[i]])
 
-        # with Timer("mask1"):
-        #     tree_mask0 = [[False for _ in range(total_tokens + 1)] for _ in range(total_tokens + 1)]
-        #     tree_mask0[0][0] = True
-        #     for i in range(total_tokens):
-        #         #tree_mask0[i + 1][0]=True
-        #         tree_mask0[i + 1][i + 1] = True
-        #         p=mask_index_list[i]
-        #         tree_mask0[i + 1][p] = True
-        #         while p:
-        #             p=mask_index_list[p-1]
-        #             tree_mask0[i + 1][p] = True
-        #     tree_mask0 = torch.tensor(tree_mask0, dtype=torch.bool)
-        #
-        # print(tree_mask0.equal(tree_mask))
         tree_position_ids = torch.sum(tree_mask, dim=1) - 1
 
         tree_mask = tree_mask.float()[None, None]
@@ -338,11 +326,11 @@ class EagleModelABC(nn.Module):
         # base model's weight is loaded from the config
 
         # load config
-        print("load eagle config...")
+        log.debug("load eagle config...")
         config = EagleConfig.from_pretrained(pretrained_model_name_or_path)
 
         # base model
-        print("load base model...")
+        log.debug("load base model...")
         base_model_name_or_path = config.base_model_name_or_path
         model = super().from_pretrained(
             base_model_name_or_path,
@@ -350,19 +338,19 @@ class EagleModelABC(nn.Module):
             **kwargs,
         )
 
-        print("Load draft model...")
+        log.debug("Load draft model...")
         draft_model_path = os.path.join(
             pretrained_model_name_or_path, "model.safetensors")
         model.setup_draft_model(draft_model_path, config=config, load_draft_weight=load_draft_weight)
 
         # tokenizer
-        print("Load tokenizer...")
+        log.debug("Load tokenizer...")
         model.tokenizer = AutoTokenizer.from_pretrained(
             base_model_name_or_path, use_fast=False)
 
         # Calibrate tree
         if total_tokens == -1:
-            print("Calibrating total tokens...")
+            log.debug("Calibrating total tokens...")
             device = model.model.layers[0].self_attn.q_proj.weight.device
             candidate_tokens = [40, 48, 50, 56, 60]
             base_times = [1, 1.05, 1.07, 1.1, 1.13]
@@ -383,7 +371,7 @@ class EagleModelABC(nn.Module):
                 times.append((end_time - start_time) / base_t)
             total_token = candidate_tokens[times.index(min(times))]
             model.draft_model.total_tokens = total_token-1
-            print(f"total_tokens set to: {total_token}")
+            log.debug(f"total_tokens set to: {total_token}")
 
         if draft_only:
             draft_model = model.draft_model
@@ -434,15 +422,6 @@ class EagleModelABC(nn.Module):
             if output_orig:
                 orig = self.lm_head(outputs[0])
             hidden_states = outputs[0]
-
-            debug_print(
-                {
-                    "self.lm_head": self.lm_head.weight,
-                    "hidden_states": hidden_states,
-                    "input_ids": input_ids
-                }, 
-                headings="In EAModel", exit_code=False
-            )
             
         if output_orig:
             return outputs, orig, hidden_states
@@ -490,13 +469,6 @@ class EagleModelABC(nn.Module):
             self.past_key_values_data = past_key_values_data
             self.current_length_data = current_length_data
 
-        debug_print(
-            {
-                # "hidden_states": hidden_states,
-                "input_ids": input_ids
-            }, 
-            headings="Before Prefill", exit_code=False
-        )
         # * target model first inference
         self.model.tree_mask = None
         outputs, orig, hidden_states = self.eagle_forward(
@@ -506,30 +478,27 @@ class EagleModelABC(nn.Module):
         )
         # orig = outputs.logits
         # hidden_states = outputs.hidden_states
-        debug_print(
-            {
-                "hidden_states": hidden_states,
-                "input_ids": input_ids
-            }, 
-            headings="After Prefill", exit_code=False
-        )
 
         # * sample token
         token = sampling_logit(logits=orig[:, -1], logits_processor=logits_processor)
 
-        print(f"token: {token.shape} | input_ids: {input_ids.shape} | hidden_state: {hidden_states.shape}")
-        print("Entering Loop...")
+        log.debug(f"token: {token.shape} | input_ids: {input_ids.shape} | hidden_state: {hidden_states.shape}")
+        log.debug("Entering Loop...")
         new_token = 0
         for idx in range(max_length):
+            # if idx > 1: 
+            #     print("Stop")
+            #     break
+
             # * Run draft model
-            # print("Draft phase...")
+            log.debug("Draft phase...")
             # *      1. concatenate the token temporaily to input_ids (This should be permanent, not temporary, find a way to replace this)
             temp_input_ids = torch.cat((input_ids, token.to(input_ids.device)), dim=1)
             draft_tokens, retrieve_indices, tree_mask, tree_position_ids = self.draft_model.topK_generate(hidden_states, temp_input_ids, logits_processor)
             draft_tokens = draft_tokens.to(input_ids.device)  # [Multiple GPU Support]
 
             # * obtains the logits of predictions from target model, by considering the tree_mask (task: validation)
-            # print("Verification Phase...")
+            log.debug("Verification Phase...")
             self.model.tree_mask = tree_mask
             logits, hidden_state_new = tree_decoding(
                 self,
@@ -630,8 +599,8 @@ class EagleModelABC(nn.Module):
         # * sample token
         token = sampling_logit(logits=orig[:, -1], logits_processor=logits_processor)
 
-        print(f"token: {token.shape} | input_ids: {input_ids.shape} | hidden_state: {hidden_states.shape}")
-        print("Entering Loop...")
+        log.debug(f"token: {token.shape} | input_ids: {input_ids.shape} | hidden_state: {hidden_states.shape}")
+        log.debug("Entering Loop...")
         new_token = 0
         for idx in range(max_length):
             # * Run draft model

@@ -1,14 +1,18 @@
 # Source: https://github.com/huggingface/transformers/blob/v4.31-release/src/transformers/models/llama/modeling_llama.py
 # Modifications are denoted by the symbol: [MODIFIED]
 
-def debug_print(tensor_dict, headings="DEBUG", exit_code=False):
-    print(f"------------------ {headings}")
+import logging as log
+
+def debug_print(tensor_dict, headings="DEBUG", print_data=False, exit_code=False):
+    log.debug(f"------------------ {headings}")
     for key, value in tensor_dict.items():
-        print(f"{key}:\t {value.device}, {value.shape}")
-    print("------------------")
+        log.debug(f"{key}:\t {value.device}, {value.shape}")
+        if print_data:
+            log.debug(value)
+    log.debug("------------------")
 
     if exit_code is True:
-        print("Exited.")
+        log.debug("Exited.")
         exit(1)
 
 """ PyTorch LLaMA model."""
@@ -902,6 +906,9 @@ class LlamaModel(LlamaPreTrainedModel):
     def _prepare_decoder_attention_mask(
             self, attention_mask, input_shape, inputs_embeds, past_key_values_length
     ):
+        log.debug("1-Enter _prepare_decoder_attention_mask:")
+        log.debug(f"attention_mask.shape: {attention_mask.shape}")
+        log.debug(attention_mask)
         # create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
         combined_attention_mask = None
@@ -925,6 +932,10 @@ class LlamaModel(LlamaPreTrainedModel):
                 else expanded_attn_mask + combined_attention_mask
             )
 
+        log.debug("2-Before tree masking:")
+        log.debug(f"combined_attention_mask.shape: {combined_attention_mask.shape}")
+        log.debug(combined_attention_mask)
+
         # [MODIFIED] add tree mask
         if hasattr(self, "tree_mask") and self.tree_mask is not None:
             tree_mask = self.tree_mask
@@ -939,7 +950,13 @@ class LlamaModel(LlamaPreTrainedModel):
         #         tree_mask == 0
         #         ] = combined_attention_mask.min()
 
+            log.debug("3-After tree masking:")
+            log.debug(f"combined_attention_mask.shape: {combined_attention_mask.shape}")
+            log.debug(combined_attention_mask)
+        else:
+            log.debug("No tree masking.")
         return combined_attention_mask
+
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
