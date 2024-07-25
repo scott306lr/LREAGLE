@@ -421,6 +421,9 @@ def main(args):
     # create new head and embed_tokens
     head = torch.nn.Linear(big_model.config.hidden_size, big_model.config.vocab_size, bias=False)
     embed_tokens = nn.Embedding(big_model.config.vocab_size,big_model.config.hidden_size, big_model.config.pad_token_id)
+    head.weight.data = big_model.lm_head.weight.data
+    embed_tokens.weight.data = big_model.get_input_embeddings().weight.data
+    
     # not traininable
     for param in head.parameters():
         param.requires_grad = False
@@ -433,6 +436,7 @@ def main(args):
     draft_config = deepcopy(config)
     draft_config.num_hidden_layers = 1
     tiny_model = LlamaModel(draft_config)
+    del tiny_model.embed_tokens
     model = DraftModel(draft_config)
     model.model = tiny_model
     model.lm_head = head
